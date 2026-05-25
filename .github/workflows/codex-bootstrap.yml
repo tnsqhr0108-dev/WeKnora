@@ -2,8 +2,6 @@ name: Codex Bootstrap Check
 
 on:
   workflow_dispatch:
-  push:
-  pull_request:
 
 jobs:
   check:
@@ -15,7 +13,7 @@ jobs:
       - name: Show repository state
         run: |
           pwd
-          git branch --show-current
+          git branch --show-current || true
           git rev-parse HEAD
           git status --short
           find . -maxdepth 3 -type f | sort
