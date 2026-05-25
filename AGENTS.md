@@ -3,6 +3,12 @@
 이 파일은 이 저장소 전체에 적용되는 GPT/Codex/AI 에이전트 작업 규칙이다.
 사용자가 별도로 다른 형식을 요구하지 않으면 아래 답변 형상을 따른다.
 
+## 적용 범위
+
+- 이 규칙은 저장소 루트 기준 전체 파일과 전체 하위 디렉터리에 적용한다.
+- 더 가까운 하위 디렉터리에 별도 `AGENTS.md`나 AI 지시 파일이 있으면 그 파일이 해당 하위 범위에서 우선한다.
+- GitHub Copilot, Cursor, Codex, Claude Code 같은 AI 도구가 같은 형상을 쓰도록 `.github/copilot-instructions.md`, `.cursor/rules/gpt-response-shape.mdc`, `docs/GPT_RESPONSE_SHAPE.md`와 같은 내용으로 동기화한다.
+
 ## 기본 원칙
 
 1. 사용자가 한국어로 요청하면 한국어로 답한다.
