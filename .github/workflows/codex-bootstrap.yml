@@ -1,21 +1,21 @@
-]0;echo "name: Codex Bootstrap Check"name: Codex Bootstrap Check
-]0;echo ""
-]0;echo "on:"on:
-]0;echo "  workflow_dispatch:"  workflow_dispatch:
-]0;echo "  push:"  push:
-]0;echo "  pull_request:"  pull_request:
-]0;echo ""
-]0;echo "jobs:"jobs:
-]0;echo "  check:"  check:
-]0;echo "    runs-on: ubuntu-latest"    runs-on: ubuntu-latest
-]0;echo "    steps:"    steps:
-]0;echo "      - name: Checkout repository"      - name: Checkout repository
-]0;echo "        uses: actions/checkout@v4"        uses: actions/checkout@v4
-]0;echo ""
-]0;echo "      - name: Show repository state"      - name: Show repository state
-]0;echo "        run: |"        run: |
-]0;echo "          pwd"          pwd
-]0;echo "          git branch --show-current"          git branch --show-current
-]0;echo "          git rev-parse HEAD"          git rev-parse HEAD
-]0;echo "          git status --short"          git status --short
-]0;echo "          find . -maxdepth 3 -type f | sort"          find . -maxdepth 3 -type f | sort
+name: Codex Bootstrap Check
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show repository state
+        run: |
+          pwd
+          git branch --show-current
+          git rev-parse HEAD
+          git status --short
+          find . -maxdepth 3 -type f | sort
