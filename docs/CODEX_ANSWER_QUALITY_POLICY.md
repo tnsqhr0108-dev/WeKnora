@@ -1,6 +1,6 @@
 # Codex Answer Quality Policy
 
-Repository: `tnsqhr0108-dev/prompts.chat`
+Repository: `tnsqhr0108-dev/system_prompts_leaks`
 Primary branch: `main`
 
 ## Actual application rule
