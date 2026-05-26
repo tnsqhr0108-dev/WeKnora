@@ -1,6 +1,6 @@
 # Codex Answer Quality Policy
 
-Repository: `tnsqhr0108-dev/system_prompts_leaks`
+Repository: `tnsqhr0108-dev/WeKnora`
 Primary branch: `main`
 
 ## Actual application rule
