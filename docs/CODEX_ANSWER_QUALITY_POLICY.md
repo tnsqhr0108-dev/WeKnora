@@ -1,6 +1,6 @@
 # Codex Answer Quality Policy
 
-Repository: `tnsqhr0108-dev/WeKnora`
+Repository: `tnsqhr0108-dev/prompts.chat`
 Primary branch: `main`
 
 ## Actual application rule
