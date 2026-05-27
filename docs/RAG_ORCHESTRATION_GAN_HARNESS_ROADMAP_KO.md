@@ -1,49 +1,49 @@
-# RAG Orchestration GAN Harness Roadmap
+# RAG 오케스트레이션·GAN·하네스 로드맵
 
-This document is a lightweight policy and roadmap for advanced retrieval, orchestration, evaluation harnesses, and adversarial quality checks.
+이 문서는 검색, 오케스트레이션, 평가 하네스, 적대적 품질 검사를 위한 경량 정책과 로드맵이다.
 
-## Purpose
+## 목적
 
-Use this file to keep AI-assisted repository work grounded, evaluated, and resistant to hallucination.
+AI 보조 저장소 작업이 근거 기반으로 진행되고, 환각을 줄이며, 검증 가능한 품질 기준을 갖도록 한다.
 
-## RAG orchestration principles
+## RAG 오케스트레이션 원칙
 
-- Retrieve before answering when repository-specific facts matter.
-- Prefer current repository files over memory.
-- Separate evidence from inference.
-- Track missing evidence explicitly.
-- Keep citations or file paths close to claims when possible.
+- 저장소 관련 사실이 중요하면 답변 전에 검색·파일 확인을 먼저 한다.
+- 기억보다 현재 저장소 파일을 우선한다.
+- 근거와 추론을 분리한다.
+- 누락된 근거를 명시한다.
+- 가능하면 주장 가까이에 파일 경로, 명령, 커밋 같은 근거를 둔다.
 
-## Evaluation harness goals
+## 평가 하네스 목표
 
-A good evaluation harness should check:
+좋은 평가 하네스는 다음을 검사해야 한다.
 
-- answer groundedness;
-- correct file/path references;
-- command/test reporting accuracy;
-- refusal to invent results;
-- safe handling of secrets;
-- beginner readability.
+- 답변이 실제 근거에 기반하는가
+- 파일/경로 참조가 정확한가
+- 명령/테스트 보고가 사실인가
+- 확인하지 않은 결과를 만들어내지 않는가
+- 민감 정보를 안전하게 다루는가
+- 초보자도 이해할 수 있는가
 
-## Adversarial checks
+## 적대적 자가 점검
 
-Before finalizing important answers, ask:
+중요 답변을 확정하기 전에 다음을 확인한다.
 
-- Did I claim a test passed without running it?
-- Did I infer a file exists without reading or listing it?
-- Did I hide uncertainty?
-- Did I overstate completion?
-- Did I include any secret-like value?
-- Did I change more files than needed?
+- 실행하지 않은 테스트를 통과했다고 말했는가
+- 읽거나 나열하지 않은 파일이 있다고 추론했는가
+- 불확실성을 숨겼는가
+- 완료를 과장했는가
+- 민감 정보처럼 보이는 문자열을 포함했는가
+- 요청보다 더 많은 파일을 바꿨는가
 
-## Roadmap
+## 로드맵
 
-1. Maintain policy files under `docs/`.
-2. Add small sample tasks for answer quality evaluation.
-3. Add automated checks for forbidden phrases and missing status labels.
-4. Add repository-specific test command discovery.
-5. Add regression examples for hallucinated completion claims.
+1. `docs/` 아래 정책 파일을 유지한다.
+2. 답변 품질 평가용 샘플 작업을 추가한다.
+3. 금지 표현과 상태 라벨 누락을 자동 검사한다.
+4. 저장소별 테스트 명령 발견 기능을 추가한다.
+5. 허위 완료 보고 회귀 사례를 추가한다.
 
-## Minimum standard now
+## 현재 최소 기준
 
-Until an automated harness exists, every Codex answer must use manual groundedness checks and explicit uncertainty labels from `docs/CODEX_ANSWER_QUALITY_POLICY.md`.
+자동 하네스가 생기기 전까지 모든 Codex 답변은 `docs/CODEX_ANSWER_QUALITY_POLICY.md`의 근거 점검과 불확실성 라벨을 수동으로 적용해야 한다.
