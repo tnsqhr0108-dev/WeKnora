@@ -1,78 +1,104 @@
 # Codex Answer Quality Policy
 
-Repository: `tnsqhr0108-dev/WeKnora`
-Primary branch: `main`
+This policy is mandatory for Codex and AI agents working in this repository.
 
-## Actual application rule
+## Quality target
 
-This policy applies when a Codex task is opened with this repository and branch selected. Connected repositories are not automatically injected into every Codex answer; if another repository is needed, Codex must explicitly fetch or inspect it and cite the evidence.
+A 10/10 answer is:
 
-## Required pre-answer checks
+- grounded in inspected repository files, commands, logs, or test results;
+- explicit about what was checked and what was not checked;
+- safe with secrets and destructive actions;
+- useful for beginners without hiding uncertainty;
+- concise enough to act on, but detailed enough to reproduce.
 
-Before claiming status, editing files, or saying a task is complete, run or inspect:
+## Mandatory preflight
+
+Before finalizing a technical answer or committing a change, verify the repository context:
 
 ```bash
 pwd
 git branch --show-current
 git rev-parse HEAD
 git status --short
-find . -maxdepth 3 -type f | sort
+git ls-files | sort | sed -n '1,240p'
 ```
 
-If the user asks about roadmap, features, GAN loops, harnesses, MCP, RAG, orchestration, multi-agent, scoring rubrics, or handoff, also run or inspect:
+For generated files, also check the exact output path. For tests, include the test command and whether it passed, failed, or was not run.
 
-```bash
-python3 scripts/generate_feature_register_1000plus.py --check || true
-sed -n '1,220p' docs/CODEX_1000PLUS_FEATURE_LOADER_KO.md
-```
+## Required policy files
 
-## Mandatory project memory files
+Read and apply these files when relevant:
 
-Read and apply these files when they exist:
-
+- `AGENTS.md`
+- `docs/CODEX_OPERATION_CHECKLIST_KO.md`
+- `docs/MCP_SECURITY_CHECKLIST_KO.md`
+- `docs/RAG_ORCHESTRATION_GAN_HARNESS_ROADMAP_KO.md`
 - `docs/CODEX_1000PLUS_FEATURE_LOADER_KO.md`
 - `docs/FEATURE_REGISTER_1000PLUS_KO.md`
-- `docs/RAG_ORCHESTRATION_GAN_HARNESS_ROADMAP_KO.md`
-- `docs/MCP_SECURITY_CHECKLIST_KO.md`
-- `docs/CODEX_OPERATION_CHECKLIST_KO.md`
 
-If a listed file does not exist, report it as `검수하지 못함`; do not pretend it was read.
+If one is missing, say `검수하지 못함: <path>` and continue with the best safe answer.
 
-## Response shape for user-facing answers
+## Evidence hierarchy
 
-For repository, terminal, deployment, debugging, setup, MCP, RAG, orchestration, feature planning, and handoff tasks, answer in this order:
+Use this priority order:
 
-```text
-핵심 결론
-적용한 내용
-실행 방법
-검증 방법
-남은 작업
-```
+1. Actual command output from the current repository.
+2. Current repository files read during the task.
+3. Current GitHub MCP/API results for this repository.
+4. Clearly marked inference.
+5. General knowledge, only when repository evidence is unnecessary.
 
-Do not force all five sections for a very small question. If the user is a beginner or using Android Debian, prefer one copy-paste-ready command block and explain only what each major step does.
+Never promote inference to fact.
 
-## Evidence and verification rules
+## Answer structure
 
-- Answer from repository files, command output, generated artifacts, MCP results, and logs only.
-- Do not guess branch names, file names, test results, generated outputs, PDF source status, or completion status.
-- If a file, log, test, PDF, image, or artifact does not exist, say it does not exist.
-- If a check was not run, report `검수하지 못함` rather than passing it.
-- If a command fails, include the important error line and the next corrective command.
-- If a change is committed, report the commit SHA and changed files.
-- If a task depends on a server, secret, browser login, PDF upload, Git LFS, or external account, say exactly what the user must do.
-- Treat RAG, orchestration, GAN loop, harness, multi-agent, and scoring-rubric items as `예정` unless matching code, logs, tests, or docs exist.
+For repository tasks, final answers should include:
 
-## Answer quality rules
+1. **결론**: 완료, 부분 완료, 차단됨, or 검수하지 못함.
+2. **확인한 근거**: files, commands, branches, commits, tests, or logs.
+3. **변경 사항**: changed files and why.
+4. **검증 결과**: tests/checks run and their result.
+5. **남은 위험**: anything not checked or not possible to verify.
 
-- Keep user-facing answers in Korean unless the user asks otherwise.
-- Prefer small, reversible, verifiable commits.
-- Prefer the safest path for beginners over the shortest path.
-- Do not commit nested repositories, `.venv`, caches, build artifacts, or temporary files unless explicitly requested.
-- Do not print or commit tokens, API keys, cookies, passwords, or private credentials.
-- Avoid saying `완료` until verification is complete.
-- When referring to the 1000+ feature set, cite the generated feature register and use feature IDs when available.
+## Forbidden answer patterns
 
-## Completion rule
+Do not say:
 
-A task is complete only when the expected changed files, logs, generated outputs, tests, PDFs, rendered images, QA JSON, MCP results, or health reports actually exist in the repository.
+- "완료했습니다" when no artifact was verified.
+- "테스트 통과" when tests were not run.
+- "문제 없습니다" when only a partial inspection was done.
+- "아마", "대충", "보통" without labeling it as inference.
+- file names, branch names, or logs that were not inspected.
+
+## Required uncertainty labels
+
+Use these labels exactly:
+
+- `확인됨`: directly inspected and verified.
+- `추론`: likely based on evidence, but not directly verified.
+- `검수하지 못함`: not checked, unavailable, or blocked.
+- `주의`: risk that may need user or maintainer review.
+
+## Completion checklist
+
+Before reporting completion, confirm:
+
+- expected files exist;
+- changed files are intentional;
+- no obvious generated/cache files are included;
+- tests or validation commands were run when available;
+- skipped checks are named;
+- secret exposure risk was considered.
+
+## Secret handling
+
+Never reveal or commit secrets. Do not quote suspected credentials. If secret scanning or manual inspection finds sensitive material, report only the file/path and remediation steps.
+
+## Beginner mode
+
+When the user appears to be a beginner, include:
+
+- the exact next command or action;
+- a short explanation of why it matters;
+- no unexplained jargon.
