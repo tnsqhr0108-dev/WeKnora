@@ -1,58 +1,75 @@
-# Codex Operation Checklist
+# Codex 운영 체크리스트
 
-Codex must use this checklist before and after repository work.
+Codex는 저장소 작업 전후에 이 체크리스트를 사용한다.
 
-## 1. Start
+## 1. 시작
 
-- Confirm repository root.
-- Confirm branch.
-- Confirm current commit.
-- Confirm working tree status.
-- List tracked files with `git ls-files`.
-- Read `AGENTS.md` and task-relevant policy files.
+- 저장소 루트를 확인한다.
+- 현재 브랜치를 확인한다.
+- 현재 커밋을 확인한다.
+- 작업 트리 상태를 확인한다.
+- `git ls-files`로 추적 파일 목록을 확인한다.
+- `AGENTS.md`와 작업 관련 정책 파일을 읽는다.
 
-## 2. Plan
+권장 명령:
 
-- Identify requested outcome.
-- Identify files that must change.
-- Identify files that must not change.
-- Choose the smallest safe change.
-- Avoid unrelated refactors.
+```bash
+pwd
+git branch --show-current
+git rev-parse HEAD
+git status --short
+git ls-files | sort | sed -n '1,240p'
+```
 
-## 3. Edit
+## 2. 계획
 
-- Keep changes focused.
-- Do not commit generated files, caches, virtual environments, build outputs, or nested clones unless explicitly required.
-- Preserve existing style and language unless the task asks otherwise.
-- Use clear file names and headings.
+- 사용자가 원하는 최종 결과를 한 문장으로 정리한다.
+- 변경해야 할 파일을 식별한다.
+- 변경하면 안 되는 파일을 식별한다.
+- 가장 작고 안전한 변경을 선택한다.
+- 요청과 무관한 리팩터링을 하지 않는다.
 
-## 4. Verify
+## 3. 수정
 
-Run the most relevant available checks. Examples:
+- 변경 범위를 작게 유지한다.
+- 생성 파일, 캐시, 가상환경, 빌드 결과물, 중첩 clone 저장소를 커밋하지 않는다.
+- 기존 문체와 언어를 유지한다.
+- 새 문서는 경로, 목적, 사용 시점을 명확히 적는다.
+
+## 4. 검증
+
+가능한 경우 다음을 실행한다.
 
 ```bash
 git diff --check
 git status --short
 ```
 
-When the project has tests, run the smallest relevant test first. If tests cannot be run, report why.
+프로젝트 테스트가 있으면 가장 작은 관련 테스트부터 실행한다. 테스트를 실행할 수 없으면 이유를 `검수하지 못함`으로 보고한다.
 
-## 5. Report
+문서만 변경한 경우에도 다음을 확인한다.
 
-Final report must include:
+- 참조한 파일 경로가 실제로 존재하는가
+- 문서 제목과 파일명 언어가 맞는가
+- 필수 문서 목록에 누락이 없는가
+- 완료/검수/차단 라벨이 일관되는가
 
-- status label: `완료`, `부분 완료`, `검수하지 못함`, or `차단됨`;
-- changed files;
-- commands/checks performed;
-- checks not performed;
-- risks or follow-up actions.
+## 5. 보고
 
-## 6. Stop conditions
+최종 보고에는 다음을 포함한다.
 
-Stop and ask for guidance before:
+- 상태 라벨: `완료`, `부분 완료`, `검수하지 못함`, `차단됨`
+- 변경 파일
+- 수행한 명령/검사
+- 수행하지 못한 검사와 이유
+- 남은 위험 또는 후속 조치
 
-- deleting user data;
-- changing authentication or production secrets;
-- rewriting public history;
-- making broad architectural changes unrelated to the task;
-- exposing suspected credentials.
+## 6. 중단 조건
+
+다음 작업 전에는 멈추고 사용자 지시를 받는다.
+
+- 사용자 데이터 삭제
+- 인증, 운영 접근 정보, 권한 변경
+- 공개 히스토리 재작성
+- 요청과 무관한 대규모 구조 변경
+- 민감 정보 노출 가능성

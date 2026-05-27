@@ -1,20 +1,21 @@
-# Codex Answer Quality Policy
+# Codex 답변 품질 정책
 
-This policy is mandatory for Codex and AI agents working in this repository.
+이 문서는 이 저장소에서 작업하는 Codex와 AI 에이전트의 필수 답변 품질 정책이다.
 
-## Quality target
+## 10/10 답변 기준
 
-A 10/10 answer is:
+10점 답변은 다음을 모두 만족한다.
 
-- grounded in inspected repository files, commands, logs, or test results;
-- explicit about what was checked and what was not checked;
-- safe with secrets and destructive actions;
-- useful for beginners without hiding uncertainty;
-- concise enough to act on, but detailed enough to reproduce.
+- 실제로 확인한 저장소 파일, 명령 출력, 로그, 테스트 결과에 근거한다.
+- 확인한 것과 확인하지 못한 것을 분리해서 말한다.
+- 민감 정보와 파괴적 작업에 안전하다.
+- 초보자도 다음 행동을 알 수 있다.
+- 불확실성을 숨기지 않는다.
+- 재현 가능한 명령, 경로, 검증 결과를 포함한다.
 
-## Mandatory preflight
+## 필수 사전 확인
 
-Before finalizing a technical answer or committing a change, verify the repository context:
+기술 답변을 확정하거나 커밋하기 전에 저장소 상태를 확인한다.
 
 ```bash
 pwd
@@ -24,11 +25,13 @@ git status --short
 git ls-files | sort | sed -n '1,240p'
 ```
 
-For generated files, also check the exact output path. For tests, include the test command and whether it passed, failed, or was not run.
+생성 파일이 있는 작업은 정확한 출력 경로를 확인한다. 테스트를 수행한 경우 테스트 명령과 통과/실패/미실행 여부를 명시한다.
 
-## Required policy files
+터미널 실행이 불가능한 MCP 전용 환경에서는 GitHub MCP/API로 가능한 범위의 브랜치, HEAD, 파일 목록, 파일 내용을 확인하고 직접 실행하지 못한 명령은 `검수하지 못함`으로 보고한다.
 
-Read and apply these files when relevant:
+## 필수 정책 파일
+
+관련 작업에서는 다음 파일을 읽고 적용한다.
 
 - `AGENTS.md`
 - `docs/CODEX_OPERATION_CHECKLIST_KO.md`
@@ -36,69 +39,66 @@ Read and apply these files when relevant:
 - `docs/RAG_ORCHESTRATION_GAN_HARNESS_ROADMAP_KO.md`
 - `docs/CODEX_1000PLUS_FEATURE_LOADER_KO.md`
 - `docs/FEATURE_REGISTER_1000PLUS_KO.md`
+- `docs/CODEX_TASK_PROMPT_TEMPLATE_KO.md`
 
-If one is missing, say `검수하지 못함: <path>` and continue with the best safe answer.
+파일이 없으면 `검수하지 못함: <path>`라고 쓰고, 가능한 범위에서 안전하게 진행한다.
 
-## Evidence hierarchy
+## 근거 우선순위
 
-Use this priority order:
+1. 현재 저장소에서 직접 실행한 명령 출력
+2. 작업 중 읽은 현재 저장소 파일
+3. 현재 저장소에 대한 GitHub MCP/API 결과
+4. `추론`이라고 표시한 판단
+5. 저장소 근거가 필요 없는 일반 지식
 
-1. Actual command output from the current repository.
-2. Current repository files read during the task.
-3. Current GitHub MCP/API results for this repository.
-4. Clearly marked inference.
-5. General knowledge, only when repository evidence is unnecessary.
+추론을 사실처럼 승격하지 않는다.
 
-Never promote inference to fact.
+## 최종 답변 구조
 
-## Answer structure
+저장소 작업 최종 답변에는 다음을 포함한다.
 
-For repository tasks, final answers should include:
+1. **결론**: `완료`, `부분 완료`, `차단됨`, `검수하지 못함` 중 하나
+2. **확인한 근거**: 파일, 명령, 브랜치, 커밋, 테스트, 로그
+3. **변경 사항**: 변경 파일과 이유
+4. **검증 결과**: 실행한 테스트/검사와 결과
+5. **남은 위험**: 확인하지 못한 것, 차단된 것, 후속 조치
 
-1. **결론**: 완료, 부분 완료, 차단됨, or 검수하지 못함.
-2. **확인한 근거**: files, commands, branches, commits, tests, or logs.
-3. **변경 사항**: changed files and why.
-4. **검증 결과**: tests/checks run and their result.
-5. **남은 위험**: anything not checked or not possible to verify.
+## 금지 표현
 
-## Forbidden answer patterns
+다음 표현은 조건을 만족하지 않으면 금지한다.
 
-Do not say:
+- 산출물을 확인하지 않았는데 `완료했습니다`
+- 테스트를 실행하지 않았는데 `테스트 통과`
+- 일부만 봤는데 `문제 없습니다`
+- 근거 없이 `아마`, `대충`, `보통`
+- 확인하지 않은 파일명, 브랜치명, 로그, 배포 상태
 
-- "완료했습니다" when no artifact was verified.
-- "테스트 통과" when tests were not run.
-- "문제 없습니다" when only a partial inspection was done.
-- "아마", "대충", "보통" without labeling it as inference.
-- file names, branch names, or logs that were not inspected.
+## 필수 불확실성 라벨
 
-## Required uncertainty labels
+- `확인됨`: 직접 확인하고 검증함
+- `추론`: 근거는 있으나 직접 확인은 아님
+- `검수하지 못함`: 확인 불가, 미실행, 차단됨
+- `주의`: 유지보수자 검토가 필요한 위험
 
-Use these labels exactly:
+## 완료 체크리스트
 
-- `확인됨`: directly inspected and verified.
-- `추론`: likely based on evidence, but not directly verified.
-- `검수하지 못함`: not checked, unavailable, or blocked.
-- `주의`: risk that may need user or maintainer review.
+완료 보고 전 확인한다.
 
-## Completion checklist
+- 예상 파일이 존재한다.
+- 변경 파일이 의도한 범위 안에 있다.
+- 캐시, 빌드 산출물, 임시 파일이 포함되지 않았다.
+- 가능한 검증 명령을 실행했다.
+- 생략한 검사는 이름과 이유를 적었다.
+- 민감 정보 노출 위험을 고려했다.
 
-Before reporting completion, confirm:
+## 민감 정보 처리
 
-- expected files exist;
-- changed files are intentional;
-- no obvious generated/cache files are included;
-- tests or validation commands were run when available;
-- skipped checks are named;
-- secret exposure risk was considered.
+인증 정보나 운영 접근 정보를 출력하거나 커밋하지 않는다. 의심되는 값도 인용하지 않는다. 위험이 있으면 파일/경로, 위험 유형, 제거·교체·권한 검토 같은 조치만 보고한다.
 
-## Secret handling
+## 초보자 모드
 
-Never reveal or commit secrets. Do not quote suspected credentials. If secret scanning or manual inspection finds sensitive material, report only the file/path and remediation steps.
+사용자가 초보자로 보이면 다음을 포함한다.
 
-## Beginner mode
-
-When the user appears to be a beginner, include:
-
-- the exact next command or action;
-- a short explanation of why it matters;
-- no unexplained jargon.
+- 바로 실행할 명령 또는 다음 행동
+- 그 행동이 필요한 짧은 이유
+- 설명 없는 전문 용어 금지
