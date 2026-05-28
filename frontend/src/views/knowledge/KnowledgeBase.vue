@@ -2,10 +2,12 @@
 import { ref, onMounted, onUnmounted, watch, reactive, computed, nextTick, h, type ComponentPublicInstance } from "vue";
 import { MessagePlugin, Icon as TIcon } from "tdesign-vue-next";
 import DocContent from "@/components/doc-content.vue";
+import KnowledgeProcessingTimeline from "@/components/knowledge-processing-timeline.vue";
 import useKnowledgeBase from '@/hooks/useKnowledgeBase';
 import { useRoute, useRouter } from 'vue-router';
 import EmptyKnowledge from '@/components/empty-knowledge.vue';
-import VectorStoreBadge from '@/components/VectorStoreBadge.vue';
+import KBInfoPopover from '@/components/KBInfoPopover.vue';
+import KBSwitcherDropdown from '@/components/KBSwitcherDropdown.vue';
 import { getSessionsList, createSessions, generateSessionsTitle } from "@/api/chat/index";
 import { useMenuStore } from '@/stores/menu';
 import { useUIStore } from '@/stores/ui';
@@ -30,7 +32,9 @@ import {
   listKnowledgeBases,
   reparseKnowledge,
   batchDeleteKnowledge,
+  getKnowledgeSpans,
 } from "@/api/knowledge-base/index";
+import { knowledgeSpansPayloadHasTrace } from '@/utils/knowledgeTrace';
 import FAQEntryManager from './components/FAQEntryManager.vue';
 import DocumentListView from './components/DocumentListView.vue';
 import DocumentBatchBar from './components/DocumentBatchBar.vue';
@@ -281,39 +285,57 @@ const canMutateKnowledge = computed(() => {
 // Effective permission: from direct org share list or from GET /knowledge-bases/:id (e.g. agent-visible KB)
 const effectiveKBPermission = computed(() => orgStore.getKBPermission(kbId.value) || kbInfo.value?.my_permission || '');
 
-// Display role label: when accessed via share, surface the share role even
-// if the user happens to be the original creator — the active context is
-// "viewing through a shared space", and write actions will 403 regardless.
-const accessRoleLabel = computed(() => {
-  if (!isViaShare.value && isOwner.value) return t('knowledgeBase.accessInfo.roleOwner');
-  const perm = effectiveKBPermission.value;
-  if (perm) return t(`organization.role.${perm}`);
-  return '--';
-});
-
-// Permission summary text for current role (mirrors accessRoleLabel rule).
-const accessPermissionSummary = computed(() => {
-  if (!isViaShare.value && isOwner.value) return t('knowledgeBase.accessInfo.permissionOwner');
-  const perm = effectiveKBPermission.value;
-  if (perm === 'admin') return t('knowledgeBase.accessInfo.permissionAdmin');
-  if (perm === 'editor') return t('knowledgeBase.accessInfo.permissionEditor');
-  if (perm === 'viewer') return t('knowledgeBase.accessInfo.permissionViewer');
-  return '--';
-});
-
-// Last updated time from kbInfo
-const kbLastUpdated = computed(() => {
-  const raw = kbInfo.value?.updated_at;
-  if (!raw) return null;
-  return formatStringDate(new Date(raw));
-});
-
 const knowledgeList = ref<Array<{ id: string; name: string; type?: string }>>([]);
 let { cardList, total, moreIndex, details, getKnowled, delKnowledge, openMore, onVisibleChange: _onVisibleChange, getCardDetails, getfDetails } = useKnowledgeBase(kbId.value)
 const onVisibleChange = (visible: boolean) => {
   _onVisibleChange(visible);
   if (!visible) {
     moveMenuMode.value = 'normal';
+  }
+};
+
+/** Per-knowledge cache: whether /spans has a real trace (see knowledgeSpansPayloadHasTrace). */
+const traceAvailableById = reactive<Record<string, boolean>>({});
+const traceProbeInflight = new Set<string>();
+
+function clearTraceAvailabilityCache() {
+  for (const key of Object.keys(traceAvailableById)) {
+    delete traceAvailableById[key];
+  }
+  traceProbeInflight.clear();
+}
+
+function isTraceMenuVisible(item: KnowledgeCard): boolean {
+  if (!item?.id) return false;
+  if (item.parse_status === 'pending' || item.parse_status === 'processing') {
+    return true;
+  }
+  return traceAvailableById[item.id] === true;
+}
+
+async function probeTraceAvailable(item: KnowledgeCard) {
+  const id = item.id;
+  if (!id || traceProbeInflight.has(id)) return;
+  if (item.parse_status === 'pending' || item.parse_status === 'processing') {
+    traceAvailableById[id] = true;
+    return;
+  }
+  if (Object.prototype.hasOwnProperty.call(traceAvailableById, id)) return;
+  traceProbeInflight.add(id);
+  try {
+    const res: any = await getKnowledgeSpans(id);
+    traceAvailableById[id] = !!(res?.success && knowledgeSpansPayloadHasTrace(res.data));
+  } catch {
+    traceAvailableById[id] = false;
+  } finally {
+    traceProbeInflight.delete(id);
+  }
+}
+
+const onCardMoreVisibleChange = (visible: boolean, item: KnowledgeCard) => {
+  onVisibleChange(visible);
+  if (visible) {
+    probeTraceAvailable(item);
   }
 };
 let isCardDetails = ref(false);
@@ -839,6 +861,7 @@ watch(activeKbTab, (tab) => {
 
 watch(() => kbId.value, (newKbId, oldKbId) => {
   if (newKbId && newKbId !== oldKbId) {
+    clearTraceAvailabilityCache();
     cardList.value = [];
     total.value = 0;
     docListLoading.value = true;
@@ -1068,6 +1091,7 @@ const updateStatus = (analyzeList: KnowledgeCard[]) => {
             cardList.value[index].parse_status = item.parse_status;
             cardList.value[index].summary_status = item.summary_status;
             cardList.value[index].description = item.description;
+            delete traceAvailableById[item.id];
             hasChanges = true;
           }
         });
@@ -1701,14 +1725,6 @@ const handleNavigateToCurrentKB = () => {
   router.push(`/platform/knowledge-bases/${kbId.value}`);
 };
 
-const knowledgeDropdownOptions = computed(() =>
-  knowledgeList.value.map((item) => ({
-    content: item.name,
-    value: item.id,
-    prefixIcon: () => h(TIcon, { name: item.type === 'faq' ? 'chat-bubble-help' : 'folder', size: '16px' }),
-  }))
-);
-
 const handleKnowledgeDropdownSelect = (data: { value: string }) => {
   if (!data?.value) return;
   if (data.value === kbId.value) return;
@@ -1725,6 +1741,28 @@ const handleManualEdit = (index: number, item: KnowledgeCard) => {
     kbId: item.knowledge_base_id || kbId.value,
     knowledgeId: item.id,
     onSuccess: manualEditorSuccess,
+  });
+};
+
+// Opens ONLY the trace drawer for this card — does NOT pop the
+// document detail drawer behind it. The trace drawer attaches to
+// body so it renders independent of its host's visibility; we just
+// need `details` populated so the timeline component knows which
+// knowledge_id to fetch. getCardDetails resets details synchronously
+// then fills asynchronously, so we re-stamp the id/parse_status
+// right after the call to avoid the brief empty-id window that
+// would otherwise prevent the drawer from mounting.
+const docContentRef = ref<any>(null);
+const handleViewTrace = (index: number, item: KnowledgeCard) => {
+  if (cardList.value[index]) {
+    cardList.value[index].isMore = false;
+  }
+  moreIndex.value = -1;
+  getCardDetails(item);
+  details.id = item.id;
+  details.parse_status = item.parse_status;
+  nextTick(() => {
+    docContentRef.value?.openTimeline?.();
   });
 };
 
@@ -1752,6 +1790,8 @@ const rebuildConfirm = async () => {
   if (!item?.id) return;
   try {
     await reparseKnowledge(item.id);
+    delete traceAvailableById[item.id];
+    traceAvailableById[item.id] = true;
     MessagePlugin.success(t('knowledgeBase.rebuildSubmitted'));
     resetPage(); // Reset page counter when reloading files after reparse
     loadKnowledgeFiles(kbId.value);
@@ -2006,10 +2046,9 @@ async function createNewSession(value: string): Promise<void> {
                 {{ $t('menu.knowledgeBase') }}
               </button>
               <t-icon name="chevron-right" class="breadcrumb-separator" />
-              <t-dropdown v-if="knowledgeDropdownOptions.length" :options="knowledgeDropdownOptions" trigger="click"
-                placement="bottom-left" @click="handleKnowledgeDropdownSelect">
-                <button type="button" class="breadcrumb-link dropdown" :disabled="!kbId"
-                  @click.stop="handleNavigateToCurrentKB">
+              <KBSwitcherDropdown v-if="knowledgeList.length" :kb-list="knowledgeList" :current-kb-id="kbId"
+                @select="(id) => handleKnowledgeDropdownSelect({ value: id })">
+                <button type="button" class="breadcrumb-link dropdown" :disabled="!kbId">
                   <template v-if="!kbInfo">
                     <t-skeleton animation="gradient" :row-col="[{ width: '120px', height: '20px' }]" />
                   </template>
@@ -2018,7 +2057,7 @@ async function createNewSession(value: string): Promise<void> {
                     <t-icon name="chevron-down" />
                   </template>
                 </button>
-              </t-dropdown>
+              </KBSwitcherDropdown>
               <button v-else type="button" class="breadcrumb-link" :disabled="!kbId" @click="handleNavigateToCurrentKB">
                 <template v-if="!kbInfo">
                   <t-skeleton animation="gradient" :row-col="[{ width: '120px', height: '20px' }]" />
@@ -2052,53 +2091,16 @@ async function createNewSession(value: string): Promise<void> {
               </template>
               <span v-else class="breadcrumb-current">{{ $t('knowledgeEditor.document.title') }}</span>
             </h2>
-            <!-- 身份与最后更新：紧凑单行，置于标题行右侧，悬停显示权限说明 -->
-            <div v-if="kbInfo && !authStore.isLiteMode" class="kb-access-meta">
-              <t-tooltip :content="accessPermissionSummary" placement="top">
-                <span class="kb-access-meta-inner">
-                  <t-tag size="small"
-                    :theme="(!isViaShare && isOwner) ? 'success' : (effectiveKBPermission === 'admin' ? 'primary' : effectiveKBPermission === 'editor' ? 'warning' : 'default')"
-                    class="kb-access-role-tag">
-                    {{ accessRoleLabel }}
-                  </t-tag>
-                  <template v-if="currentSharedKb">
-                    <span class="kb-access-meta-sep">·</span>
-                    <span class="kb-access-meta-text">
-                      {{ $t('knowledgeBase.accessInfo.fromOrg') }}「{{ currentSharedKb.org_name }}」
-                      {{ $t('knowledgeBase.accessInfo.sharedAt') }} {{ formatStringDate(new
-                        Date(currentSharedKb.shared_at)) }}
-                    </span>
-                  </template>
-                  <template v-else-if="effectiveKBPermission">
-                    <span class="kb-access-meta-sep">·</span>
-                    <span class="kb-access-meta-text">{{ $t('knowledgeList.detail.sourceTypeAgent') }}</span>
-                  </template>
-                  <template v-else-if="kbLastUpdated">
-                    <span class="kb-access-meta-sep">·</span>
-                    <span class="kb-access-meta-text">{{ $t('knowledgeBase.accessInfo.lastUpdated') }} {{ kbLastUpdated
-                    }}</span>
-                  </template>
-                </span>
+            <!-- 标题行右侧的动作锚点：聚拢"信息"和"设置"两个圆形按钮。 -->
+            <div class="kb-title-actions">
+              <KBInfoPopover v-if="kbInfo && !authStore.isLiteMode" :kb-info="kbInfo"
+                :supported-file-types="[...supportedFileTypes]" />
+              <t-tooltip v-if="canManage" :content="$t('knowledgeBase.settings')" placement="top">
+                <button type="button" class="kb-settings-button" :disabled="!kbId" @click="handleOpenKBSettings">
+                  <t-icon name="setting" size="16px" />
+                </button>
               </t-tooltip>
-              <!-- Bound vector store indicator. Cross-tenant shared KBs
-                   render via the badge's internal "shared" branch with
-                   no name or engine type, matching the server-side
-                   response that strips those fields for non-owners. -->
-              <template v-if="kbInfo && (kbInfo as any)?.vector_store_source">
-                <span class="kb-access-meta-sep">·</span>
-                <VectorStoreBadge
-                  :source="(kbInfo as any).vector_store_source"
-                  :name="(kbInfo as any).vector_store_name"
-                  :engine-type="(kbInfo as any).vector_store_engine_type"
-                  :status="(kbInfo as any).vector_store_status"
-                />
-              </template>
             </div>
-            <t-tooltip v-if="canManage" :content="$t('knowledgeBase.settings')" placement="top">
-              <button type="button" class="kb-settings-button" :disabled="!kbId" @click="handleOpenKBSettings">
-                <t-icon name="setting" size="16px" />
-              </button>
-            </t-tooltip>
           </div>
           <p class="document-subtitle">{{ $t('knowledgeEditor.document.subtitle') }}</p>
           <p v-if="unsupportedFileTypes.length" class="parser-hint" @click="goToParserSettings">
@@ -2106,7 +2108,7 @@ async function createNewSession(value: string): Promise<void> {
             <span>{{$t('knowledgeBase.unsupportedTypesHint', {
               types: unsupportedFileTypes.map(t => '.' + t).join('、')
             })
-            }}</span>
+              }}</span>
             <span class="parser-hint-link">{{ $t('knowledgeBase.goToParserSettings') }} →</span>
           </p>
           <p v-if="missingStorageEngine" class="storage-engine-warning" @click="handleOpenKBSettings">
@@ -2330,7 +2332,8 @@ async function createNewSession(value: string): Promise<void> {
                           </div>
                           <span class="card-content-title" :title="item.file_name">{{ item.file_name }}</span>
                           <t-popup v-if="canEdit" v-model="item.isMore" overlayClassName="card-more"
-                            :on-visible-change="onVisibleChange" trigger="click" destroy-on-close
+                            :on-visible-change="(v: boolean) => onCardMoreVisibleChange(v, item)" trigger="click"
+                            destroy-on-close
                             placement="bottom-right">
                             <div variant="outline" class="more-wrap" @click.stop="openMore(index)"
                               :class="[moreIndex == index ? 'active-more' : '']">
@@ -2343,6 +2346,11 @@ async function createNewSession(value: string): Promise<void> {
                                   @click.stop="handleManualEdit(index, item)">
                                   <t-icon class="icon" name="edit" />
                                   <span>{{ t('knowledgeBase.editDocument') }}</span>
+                                </div>
+                                <div v-if="isTraceMenuVisible(item)" class="card-menu-item"
+                                  @click.stop="handleViewTrace(index, item)">
+                                  <t-icon class="icon" name="chart-bar" />
+                                  <span>{{ t('knowledgeStages.viewTrace') }}</span>
                                 </div>
                                 <div class="card-menu-item" @click.stop="handleKnowledgeReparse(index, item)">
                                   <t-icon class="icon" name="refresh" />
@@ -2505,12 +2513,12 @@ async function createNewSession(value: string): Promise<void> {
                         <div
                           v-if="hoveredCardItem.parse_status === 'processing' || hoveredCardItem.parse_status === 'pending'"
                           class="card-popover-status parsing">
-                          <t-icon name="loading" size="14px" /> {{ t('knowledgeBase.parsingInProgress') }}
+                          <KnowledgeProcessingTimeline :knowledge-id="hoveredCardItem.id"
+                            :parse-status="hoveredCardItem.parse_status" :auto-poll="false" :compact="true" />
                         </div>
                         <div v-else-if="hoveredCardItem.parse_status === 'failed'" class="card-popover-status failure">
-                          <t-icon name="close-circle" size="14px" /> {{ t('knowledgeBase.parsingFailed') }}
-                          <span v-if="(hoveredCardItem as any).error_message" class="card-popover-error-msg">{{
-                            (hoveredCardItem as any).error_message }}</span>
+                          <KnowledgeProcessingTimeline :knowledge-id="hoveredCardItem.id"
+                            :parse-status="hoveredCardItem.parse_status" :auto-poll="false" :compact="true" />
                         </div>
                         <div v-else-if="hoveredCardItem.parse_status === 'draft'" class="card-popover-status draft">
                           {{ t('knowledgeBase.draft') }}
@@ -2652,8 +2660,8 @@ async function createNewSession(value: string): Promise<void> {
       </template>
 
       <!-- DocContent drawer (shared by documents tab and wiki source refs) -->
-      <DocContent :visible="isCardDetails" :details="details" :canEditKB="canEdit" @closeDoc="closeDoc"
-        @getDoc="getDoc">
+      <DocContent ref="docContentRef" :visible="isCardDetails" :details="details" :canEditKB="canEdit"
+        @closeDoc="closeDoc" @getDoc="getDoc">
       </DocContent>
     </div>
   </template>
@@ -3307,31 +3315,12 @@ async function createNewSession(value: string): Promise<void> {
     flex-wrap: wrap;
   }
 
-  .kb-access-meta {
-    margin-left: auto;
-    flex-shrink: 0;
-  }
-
-  .kb-access-meta-inner {
+  .kb-title-actions {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
-    color: var(--td-text-color-secondary);
-    cursor: default;
-  }
-
-  .kb-access-role-tag {
     flex-shrink: 0;
-  }
-
-  .kb-access-meta-sep {
-    color: var(--td-text-color-placeholder);
-    user-select: none;
-  }
-
-  .kb-access-meta-text {
-    white-space: nowrap;
+    margin-left: 4px;
   }
 
   .document-breadcrumb {

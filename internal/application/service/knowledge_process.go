@@ -466,19 +466,40 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	// Chunks are needed for wiki generation, graph extraction, and summary generation
 	// even when vector/keyword indexing is disabled.
 	span.AddEvent("create chunks")
+	s.beginStage(ctx, knowledge.ID, types.StageChunking, types.JSONMap{
+		"chunks_planned": len(insertChunks),
+	})
 	if err := s.chunkService.CreateChunks(ctx, insertChunks); err != nil {
 		knowledge.ParseStatus = types.ParseStatusFailed
 		knowledge.ErrorMessage = err.Error()
 		knowledge.UpdatedAt = time.Now()
 		s.repo.UpdateKnowledge(ctx, knowledge)
 		span.RecordError(err)
+		s.failStage(ctx, knowledge.ID, types.StageChunking,
+			werrors.ErrCodeChunkingFailed, "create chunks failed", err)
 		return
 	}
+	totalChunkChars := 0
+	for _, c := range insertChunks {
+		totalChunkChars += len(c.Content)
+	}
+	s.endStage(ctx, knowledge.ID, types.StageChunking, types.JSONMap{
+		"chunks_written":   len(insertChunks),
+		"total_text_chars": totalChunkChars,
+	})
 
 	// Create index information and perform vector indexing — only when vector/keyword is enabled.
 	// Chunks are ALWAYS saved to DB (above) because wiki and graph need them even without vector indexing.
 	var totalStorageSize int64
 	if kb.NeedsEmbeddingModel() && embeddingModel != nil {
+		embedInput := types.JSONMap{
+			"chunks_to_embed": len(textChunks),
+			"model_id":        kb.EmbeddingModelID,
+		}
+		if dim := embeddingModel.GetDimensions(); dim > 0 {
+			embedInput["dim"] = dim
+		}
+		s.beginStage(ctx, knowledge.ID, types.StageEmbedding, embedInput)
 		// Create index information — only for child/flat chunks, NOT parent chunks.
 		// Parent chunks are stored for context retrieval but do not need vector embeddings.
 		// Prepend the document title to improve semantic alignment between
@@ -560,9 +581,21 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 				logger.Errorf(ctx, "Delete index failed: %v", err)
 			}
 			span.RecordError(err)
+			// Map vector store / embedding rate-limit errors to a
+			// stable code so the UI can offer "retry later" hints.
+			code := werrors.ErrCodeVectorStoreWriteFailed
+			if isLikelyRateLimitError(err) {
+				code = werrors.ErrCodeEmbeddingRateLimit
+			}
+			s.failStage(ctx, knowledge.ID, types.StageEmbedding,
+				code, "batch index failed", err)
 			return
 		}
 		logger.GetLogger(ctx).Infof("processChunks batch index successfully, with %d index", len(indexInfoList))
+		s.endStage(ctx, knowledge.ID, types.StageEmbedding, types.JSONMap{
+			"vectors_written": len(indexInfoList),
+			"storage_bytes":   totalStorageSize,
+		})
 
 		// Final check before marking as completed - if deleted during processing, don't update status
 		if s.isKnowledgeDeleting(ctx, knowledge.TenantID, knowledge.ID) {
@@ -579,6 +612,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		}
 	} else {
 		logger.Infof(ctx, "Vector/keyword indexing disabled for KB %s, skipping BatchIndex", kb.ID)
+		s.skipStage(ctx, knowledge.ID, types.StageEmbedding, "skipped")
 	}
 
 	// Check if this document has extracted images that will be processed asynchronously
@@ -602,8 +636,14 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 
 	// Enqueue multimodal tasks for images (async, non-blocking)
 	if options.EnableMultimodel && len(options.StoredImages) > 0 {
+		s.beginStage(ctx, knowledge.ID, types.StageMultimodal, types.JSONMap{
+			"image_count":    len(options.StoredImages),
+			"enable_ocr":     true,
+			"enable_caption": true,
+		})
 		s.enqueueImageMultimodalTasks(ctx, knowledge, kb, options.StoredImages, chunks, options.Metadata)
 	} else {
+		s.skipStage(ctx, knowledge.ID, types.StageMultimodal, "skipped")
 		// If there are no multimodal tasks, enqueue the post process task immediately
 		lang, _ := types.LanguageFromContext(ctx)
 		postProcessPayload := types.KnowledgePostProcessPayload{
@@ -611,6 +651,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			KnowledgeID:     knowledge.ID,
 			KnowledgeBaseID: knowledge.KnowledgeBaseID,
 			Language:        lang,
+			Attempt:         attemptFromCtx(ctx),
 		}
 		langfuse.InjectTracing(ctx, &postProcessPayload)
 		payloadBytes, err := json.Marshal(postProcessPayload)
@@ -846,15 +887,44 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 		ctx = context.WithValue(ctx, types.LanguageContextKey, payload.Language)
 	}
 
+	// Open a subspan under the parent attempt's postprocess stage so the
+	// trace surface shows the real summary-generation duration (LLM call
+	// + chunk write + index) instead of just the upstream's enqueue time.
+	// Closes via the deferred handler below — every return path lands in
+	// the defer, including the early returns ahead.
+	span := s.beginPostprocessSubspan(ctx, payload.KnowledgeID, payload.Attempt, "postprocess.summary",
+		types.JSONMap{
+			"language": payload.Language,
+		})
+	var summaryErr error
+	summaryOut := types.JSONMap{}
+	defer func() {
+		if span == nil {
+			return
+		}
+		if summaryErr != nil {
+			s.failPostprocessSubspan(ctx, span, "SUMMARY_FAILED", summaryErr.Error(), summaryErr)
+		} else {
+			s.endPostprocessSubspan(ctx, span, summaryOut)
+		}
+	}()
+
 	// Get knowledge base
 	kb, err := s.kbService.GetKnowledgeBaseByID(ctx, payload.KnowledgeBaseID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get knowledge base: %v", err)
+		summaryErr = err
 		return nil
 	}
+	// Capture the resolved model id on the span output the moment we
+	// know it — debugging "summary stage took 60s" benefits hugely from
+	// seeing WHICH chat model was actually used (kb config drift, fall-
+	// throughs to a slow upstream, etc.).
+	summaryOut["model_id"] = kb.SummaryModelID
 
 	if kb.SummaryModelID == "" {
 		logger.Warn(ctx, "Knowledge base summary model ID is empty, skipping summary generation")
+		summaryOut["skipped"] = "no_summary_model"
 		return nil
 	}
 
@@ -862,6 +932,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 	knowledge, err := s.repo.GetKnowledgeByID(ctx, payload.TenantID, payload.KnowledgeID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get knowledge: %v", err)
+		summaryErr = err
 		return nil
 	}
 
@@ -886,6 +957,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get chunks: %v", err)
 		markSummaryFailed()
+		summaryErr = err
 		return nil
 	}
 
@@ -896,6 +968,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 			textChunks = append(textChunks, chunk)
 		}
 	}
+	summaryOut["text_chunks"] = len(textChunks)
 
 	if len(textChunks) == 0 {
 		logger.Infof(ctx, "No text chunks found for knowledge: %s", payload.KnowledgeID)
@@ -903,6 +976,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 		knowledge.SummaryStatus = types.SummaryStatusCompleted
 		knowledge.UpdatedAt = time.Now()
 		s.repo.UpdateKnowledge(ctx, knowledge)
+		summaryOut["skipped"] = "no_text_chunks"
 		return nil
 	}
 
@@ -916,6 +990,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get chat model: %v", err)
 		markSummaryFailed()
+		summaryErr = err
 		return fmt.Errorf("failed to get chat model: %w", err)
 	}
 
@@ -923,6 +998,13 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 	summary, err := s.getSummary(ctx, chatModel, knowledge, textChunks)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to generate summary for knowledge %s: %v", payload.KnowledgeID, err)
+		// Surface the underlying LLM/IO error on the span so the trace UI
+		// can explain "why did this stage take 60s and then fall back?"
+		// without forcing the operator to grep worker logs. We also capture
+		// the error type to disambiguate timeouts from upstream HTTP errors
+		// (deadline exceeded vs unexpected EOF vs 5xx, etc.).
+		summaryOut["error"] = previewText(err.Error(), 500)
+		summaryOut["error_type"] = fmt.Sprintf("%T", err)
 		// For the insufficient-content case (scanned PDF without OCR, etc.)
 		// we deliberately do NOT fall back to the first chunk's raw content,
 		// since that chunk is typically just a bare markdown image reference
@@ -933,8 +1015,11 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 			knowledge.UpdatedAt = time.Now()
 			if updateErr := s.repo.UpdateKnowledge(ctx, knowledge); updateErr != nil {
 				logger.Errorf(ctx, "Failed to mark summary as failed: %v", updateErr)
+				summaryErr = updateErr
 				return fmt.Errorf("failed to update knowledge: %w", updateErr)
 			}
+			summaryOut["fallback"] = "insufficient_content"
+			summaryErr = err
 			return nil
 		}
 		// For other errors (LLM API issues etc.), fall back to the first chunk.
@@ -946,6 +1031,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 					summary = string(runes[:500])
 				}
 			}
+			summaryOut["fallback"] = "first_chunk"
 		}
 	}
 
@@ -953,8 +1039,15 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 	knowledge.Description = summary
 	knowledge.SummaryStatus = types.SummaryStatusCompleted
 	knowledge.UpdatedAt = time.Now()
+	summaryOut["summary_chars"] = len([]rune(summary))
+	// Preview the generated summary on the span output so the trace
+	// viewer can show "this is what the LLM produced" at a glance,
+	// without hopping to the knowledge-detail page. Capped to keep
+	// span rows compact.
+	summaryOut["summary_preview"] = previewText(summary, 240)
 	if err := s.repo.UpdateKnowledge(ctx, knowledge); err != nil {
 		logger.Errorf(ctx, "Failed to update knowledge description: %v", err)
+		summaryErr = err
 		return fmt.Errorf("failed to update knowledge: %w", err)
 	}
 
@@ -993,6 +1086,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 		// Save summary chunk
 		if err := s.chunkService.CreateChunks(ctx, []*types.Chunk{summaryChunk}); err != nil {
 			logger.Errorf(ctx, "Failed to create summary chunk: %v", err)
+			summaryErr = err
 			return fmt.Errorf("failed to create summary chunk: %w", err)
 		}
 
@@ -1000,6 +1094,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 		tenantInfo, err := s.tenantRepo.GetTenantByID(ctx, payload.TenantID)
 		if err != nil {
 			logger.Errorf(ctx, "Failed to get tenant info: %v", err)
+			summaryErr = err
 			return fmt.Errorf("failed to get tenant info: %w", err)
 		}
 		ctx = context.WithValue(ctx, types.TenantInfoContextKey, tenantInfo)
@@ -1008,12 +1103,14 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 			ctx, s.retrieveEngine, s.ownership, tenantInfo.ID, kb.VectorStoreID)
 		if err != nil {
 			logger.Errorf(ctx, "Failed to init retrieve engine: %v", err)
+			summaryErr = err
 			return fmt.Errorf("failed to init retrieve engine: %w", err)
 		}
 
 		embeddingModel, err := s.modelService.GetEmbeddingModel(ctx, kb.EmbeddingModelID)
 		if err != nil {
 			logger.Errorf(ctx, "Failed to get embedding model: %v", err)
+			summaryErr = err
 			return fmt.Errorf("failed to get embedding model: %w", err)
 		}
 
@@ -1029,13 +1126,16 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 
 		if err := retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfo); err != nil {
 			logger.Errorf(ctx, "Failed to index summary chunk: %v", err)
+			summaryErr = err
 			return fmt.Errorf("failed to index summary chunk: %w", err)
 		}
 
 		logger.Infof(ctx, "Successfully created and indexed summary chunk for knowledge: %s", payload.KnowledgeID)
+		summaryOut["summary_chunk_indexed"] = true
 	}
 
 	logger.Infof(ctx, "Successfully generated summary for knowledge: %s", payload.KnowledgeID)
+	summaryOut["status"] = "completed"
 	return nil
 }
 
@@ -1060,6 +1160,18 @@ func (s *knowledgeService) ProcessQuestionGeneration(ctx context.Context, t *asy
 	indexEntriesPrepared := 0
 	indexBatchAttempted := false
 	indexBatchSucceeded := false
+	// Sample question + model id surfaced on the span output so the
+	// trace viewer can answer "what did the LLM actually produce?" and
+	// "which model did it run on?" without joining back to the chunk
+	// store. Captured the first time we see a non-empty question batch.
+	var sampleQuestion string
+	var resolvedModelID string
+	// Postprocess subspan for the trace viewer. Opened lazily after we
+	// unmarshal the payload (so we have payload.Attempt) and closed in
+	// the defer below alongside the stats log so the span output mirrors
+	// what we already log to stdout.
+	var qSpan *Span
+	var qErr error
 	defer func() {
 		logger.Infof(
 			ctx,
@@ -1084,6 +1196,49 @@ func (s *knowledgeService) ProcessQuestionGeneration(ctx context.Context, t *asy
 			indexBatchAttempted,
 			indexBatchSucceeded,
 		)
+		if qSpan != nil {
+			out := types.JSONMap{
+				"status":                 exitStatus,
+				"total_chunks":           totalChunks,
+				"text_chunks":            totalTextChunks,
+				"empty_content_chunks":   emptyContentChunks,
+				"llm_attempts":           llmCallAttempts,
+				"llm_success":            llmCallSuccess,
+				"llm_empty":              llmCallEmpty,
+				"llm_failed":             llmCallFailed,
+				"questions_generated":    generatedQuestionsTotal,
+				"chunk_update_failed":    chunkUpdateFailed,
+				"metadata_set_failed":    chunkMetadataSetFailed,
+				"index_entries_prepared": indexEntriesPrepared,
+				"index_batch_attempted":  indexBatchAttempted,
+				"index_batch_succeeded":  indexBatchSucceeded,
+				"retry":                  retryCount,
+				"max_retry":              maxRetry,
+			}
+			// Surface the resolved model id and a sample question on the
+			// span output. These help debugging "why is question generation
+			// slow" — both questions ("which model was hit?") and ("what
+			// did it produce?") are hard to answer from logs alone.
+			if resolvedModelID != "" {
+				out["model_id"] = resolvedModelID
+			}
+			if sampleQuestion != "" {
+				out["sample_question"] = sampleQuestion
+			}
+			// Treat any non-success exitStatus as a failed run; the
+			// existing stats-string already enumerates them. qErr stays
+			// optional for callers that want to surface a Go error.
+			if exitStatus != "success" || qErr != nil {
+				msg := exitStatus
+				var detailErr error = qErr
+				if qErr != nil {
+					msg = qErr.Error()
+				}
+				s.failPostprocessSubspan(ctx, qSpan, "QUESTION_FAILED", msg, detailErr)
+			} else {
+				s.endPostprocessSubspan(ctx, qSpan, out)
+			}
+		}
 	}()
 
 	if err := json.Unmarshal(t.Payload(), &payload); err != nil {
@@ -1094,6 +1249,14 @@ func (s *knowledgeService) ProcessQuestionGeneration(ctx context.Context, t *asy
 
 	logger.Infof(ctx, "Processing question generation for knowledge: %s", payload.KnowledgeID)
 
+	// Open the postprocess.question subspan now that we have payload.Attempt.
+	// Closes via the defer above.
+	qSpan = s.beginPostprocessSubspan(ctx, payload.KnowledgeID, payload.Attempt, "postprocess.question",
+		types.JSONMap{
+			"question_count": payload.QuestionCount,
+			"language":       payload.Language,
+		})
+
 	// Set tenant context
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, payload.TenantID)
 	if payload.Language != "" {
@@ -1103,7 +1266,8 @@ func (s *knowledgeService) ProcessQuestionGeneration(ctx context.Context, t *asy
 	if strings.TrimSpace(s.config.Conversation.GenerateQuestionsPrompt) == "" {
 		exitStatus = "prompt_not_configured"
 		logger.Errorf(ctx, "GenerateQuestionsPrompt is empty: configure conversation.generate_questions_prompt_id")
-		return fmt.Errorf("generate questions prompt not configured")
+		qErr = fmt.Errorf("generate questions prompt not configured")
+		return qErr
 	}
 
 	// Get knowledge base
@@ -1111,6 +1275,7 @@ func (s *knowledgeService) ProcessQuestionGeneration(ctx context.Context, t *asy
 	if err != nil {
 		exitStatus = "kb_not_found"
 		logger.Errorf(ctx, "Failed to get knowledge base: %v", err)
+		qErr = err
 		return nil
 	}
 
@@ -1119,6 +1284,7 @@ func (s *knowledgeService) ProcessQuestionGeneration(ctx context.Context, t *asy
 	if err != nil {
 		exitStatus = "knowledge_not_found"
 		logger.Errorf(ctx, "Failed to get knowledge: %v", err)
+		qErr = err
 		return nil
 	}
 
@@ -1158,6 +1324,7 @@ func (s *knowledgeService) ProcessQuestionGeneration(ctx context.Context, t *asy
 		logger.Errorf(ctx, "Failed to get chat model: %v", err)
 		return fmt.Errorf("failed to get chat model: %w", err)
 	}
+	resolvedModelID = kb.SummaryModelID
 
 	// Initialize embedding model and retrieval engine
 	embeddingModel, err := s.modelService.GetEmbeddingModel(ctx, kb.EmbeddingModelID)
@@ -1237,6 +1404,9 @@ func (s *knowledgeService) ProcessQuestionGeneration(ctx context.Context, t *asy
 		}
 		llmCallSuccess++
 		generatedQuestionsTotal += len(questions)
+		if sampleQuestion == "" && len(questions) > 0 {
+			sampleQuestion = previewText(questions[0], 200)
+		}
 
 		// Update chunk metadata with unique IDs for each question
 		generatedQuestions := make([]types.GeneratedQuestion, len(questions))
@@ -1378,6 +1548,19 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 		return nil, err
 	}
 
+	// Allocate a fresh span tree attempt up front. Doing this BEFORE
+	// the cleanup + enqueue means: (a) the UI immediately sees a new
+	// attempt with all five stages back to "pending" instead of the
+	// previous run's "failed" badge lingering; (b) the worker's
+	// fallback path won't double-allocate when payload.Attempt is
+	// already set on the queued task.
+	reparseAttempt := 0
+	if root, n, err := s.tracker().OpenAttempt(ctx, existing.ID, ""); err == nil && root != nil {
+		reparseAttempt = n
+	} else if err != nil {
+		logger.Warnf(ctx, "[Reparse] OpenAttempt failed for %s: %v (will fall back in worker)", existing.ID, err)
+	}
+
 	// Get knowledge base configuration
 	kb, err := s.kbService.GetKnowledgeBaseByID(ctx, existing.KnowledgeBaseID)
 	if err != nil {
@@ -1476,6 +1659,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			EnableQuestionGeneration: enableQuestionGeneration,
 			QuestionCount:            questionCount,
 			Language:                 lang,
+			Attempt:                  reparseAttempt,
 		}
 
 		langfuse.InjectTracing(ctx, &taskPayload)
@@ -1529,6 +1713,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			EnableQuestionGeneration: enableQuestionGeneration,
 			QuestionCount:            questionCount,
 			Language:                 lang,
+			Attempt:                  reparseAttempt,
 		}
 
 		langfuse.InjectTracing(ctx, &taskPayload)
@@ -1575,6 +1760,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			EnableQuestionGeneration: enableQuestionGeneration,
 			QuestionCount:            questionCount,
 			Language:                 lang,
+			Attempt:                  reparseAttempt,
 		}
 
 		langfuse.InjectTracing(ctx, &taskPayload)
@@ -1980,6 +2166,20 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		return nil
 	}
 
+	// Resolve the attempt for span tracking. The enqueue site sets
+	// payload.Attempt to a fresh number for the initial parse and to
+	// max+1 for each user-initiated reparse. Asynq retries within a
+	// single user action keep the same payload (so retries record
+	// onto the same attempt). For payloads predating this code we
+	// fall back to OpenAttempt.
+	attempt := payload.Attempt
+	if attempt <= 0 {
+		if root, n, err := s.tracker().OpenAttempt(ctx, knowledge.ID, payload.LangfuseTraceID); err == nil && root != nil {
+			attempt = n
+		}
+	}
+	ctx = withAttempt(ctx, attempt)
+
 	// 检查多模态配置（仅对文件导入）
 	if payload.FilePath != "" && !payload.EnableMultimodel && IsImageType(payload.FileType) {
 		logger.GetLogger(ctx).WithField("knowledge_id", knowledge.ID).
@@ -2283,6 +2483,20 @@ func (s *knowledgeService) convert(
 	knowledge *types.Knowledge,
 	isLastRetry bool,
 ) (*types.ReadResult, error) {
+	// Stage tracking: docreader. Mark the stage as running here so the
+	// timeline reflects "DocReader" the moment a worker picks the task
+	// up — before that, the stage stays "pending" from the initial
+	// upload. Failure/skip transitions are emitted at the specific
+	// failure points below; success is emitted at the bottom.
+	docInput := types.JSONMap{
+		"file_name": payload.FileName,
+		"file_type": payload.FileType,
+		"is_url":    payload.URL != "",
+	}
+	if payload.URL != "" {
+		docInput["url"] = payload.URL
+	}
+	s.beginStage(ctx, knowledge.ID, types.StageDocReader, docInput)
 	isURL := payload.URL != ""
 	fileType := payload.FileType
 	overrides := s.getParserEngineOverridesFromContext(ctx)
@@ -2294,6 +2508,8 @@ func (s *knowledgeService) convert(
 			knowledge.ErrorMessage = "URL is not allowed for security reasons"
 			knowledge.UpdatedAt = time.Now()
 			s.repo.UpdateKnowledge(ctx, knowledge)
+			s.failStage(ctx, knowledge.ID, types.StageDocReader,
+				werrors.ErrCodeDocReaderParseFailed, "URL rejected for security reasons", err)
 			return nil, nil
 		}
 	}
@@ -2314,6 +2530,8 @@ func (s *knowledgeService) convert(
 		knowledge.ErrorMessage = "Document parsing service is not configured. Please use text/paragraph import or set DOCREADER_ADDR."
 		knowledge.UpdatedAt = time.Now()
 		s.repo.UpdateKnowledge(ctx, knowledge)
+		s.failStage(ctx, knowledge.ID, types.StageDocReader,
+			werrors.ErrCodeDocReaderUnavailable, knowledge.ErrorMessage, nil)
 		return nil, nil
 	}
 
@@ -2328,11 +2546,15 @@ func (s *knowledgeService) convert(
 	if !isURL {
 		fileReader, err := s.resolveFileServiceForPath(ctx, kb, payload.FilePath).GetFile(ctx, payload.FilePath)
 		if err != nil {
+			s.failStage(ctx, knowledge.ID, types.StageDocReader,
+				werrors.ErrCodeDocReaderParseFailed, "failed to get file", err)
 			return s.failKnowledge(ctx, knowledge, isLastRetry, "failed to get file: %v", err)
 		}
 		defer fileReader.Close()
 		contentBytes, err := io.ReadAll(fileReader)
 		if err != nil {
+			s.failStage(ctx, knowledge.ID, types.StageDocReader,
+				werrors.ErrCodeDocReaderParseFailed, "failed to read file", err)
 			return s.failKnowledge(ctx, knowledge, isLastRetry, "failed to read file: %v", err)
 		}
 		req.FileContent = contentBytes
@@ -2340,8 +2562,17 @@ func (s *knowledgeService) convert(
 		req.FileType = fileType
 	}
 
-	result, err := reader.Read(ctx, req)
+	result, err := s.callDocReaderWithTimeout(ctx, reader, req)
 	if err != nil {
+		// Distinguish DocReader timeout (a knowable user-facing
+		// failure) from generic read errors so the UI can suggest
+		// "split this large file" specifically when relevant.
+		code := werrors.ErrCodeDocReaderParseFailed
+		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "docreader call timeout") {
+			code = werrors.ErrCodeDocReaderTimeout
+		}
+		s.failStage(ctx, knowledge.ID, types.StageDocReader,
+			code, "document read failed", err)
 		return s.failKnowledge(ctx, knowledge, isLastRetry, "document read failed: %v", err)
 	}
 	if result.Error != "" {
@@ -2351,12 +2582,76 @@ func (s *knowledgeService) convert(
 		knowledge.ErrorMessage = result.Error
 		knowledge.UpdatedAt = time.Now()
 		s.repo.UpdateKnowledge(ctx, knowledge)
+		s.failStage(ctx, knowledge.ID, types.StageDocReader,
+			werrors.ErrCodeDocReaderParseFailed, result.Error, nil)
 		return nil, nil
 	}
+	docOutput := types.JSONMap{
+		"text_length":  len(result.MarkdownContent),
+		"images_found": len(result.ImageRefs),
+		"is_audio":     result.IsAudio,
+	}
+	if pages := result.Metadata["pages"]; pages != "" {
+		docOutput["pages"] = pages
+	}
+	s.endStage(ctx, knowledge.ID, types.StageDocReader, docOutput)
 	return result, nil
 }
 
-// resolveDocReader returns the appropriate DocReader for the given engine.
+// callDocReaderWithTimeout wraps the DocReader RPC in a child context whose
+// deadline is min(parent_deadline, DocReaderCallTimeout). Without this cap,
+// a hung docreader (network partition, GC pause, OCR runaway) silently
+// burns the whole DocumentProcessTimeout budget and pins a worker for hours
+// — the #1 cause of "knowledge stuck in processing" reports.
+//
+// On timeout we annotate the error so retries / dead-letter consumers can
+// distinguish "docreader was slow" from "docreader returned an error".
+func (s *knowledgeService) callDocReaderWithTimeout(
+	ctx context.Context, reader interfaces.DocReader, req *types.ReadRequest,
+) (*types.ReadResult, error) {
+	timeout := 30 * time.Minute
+	if s.config != nil && s.config.KnowledgeBase != nil && s.config.KnowledgeBase.DocReaderCallTimeout > 0 {
+		timeout = s.config.KnowledgeBase.DocReaderCallTimeout
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	start := time.Now()
+	result, err := reader.Read(callCtx, req)
+	elapsed := time.Since(start)
+	if err != nil {
+		// Promote DeadlineExceeded into a clearer message; retain underlying
+		// error via %w so errors.Is(callCtx.Err(), context.DeadlineExceeded)
+		// still works for upstream classification.
+		if errors.Is(callCtx.Err(), context.DeadlineExceeded) && !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			logger.Errorf(ctx, "[convert] docreader call timed out after %s (limit %s) for %q",
+				elapsed, timeout, req.FileName)
+			return nil, fmt.Errorf("docreader call timeout after %s: %w", timeout, err)
+		}
+		return nil, err
+	}
+	logger.Infof(ctx, "[convert] docreader call ok in %s for %q", elapsed, req.FileName)
+	return result, nil
+}
+
+// isLikelyRateLimitError performs a fuzzy classification of an error as a
+// rate-limit / quota / backpressure failure. We only need a hint — the
+// caller maps to one of two error_codes so the UI can offer "retry later"
+// vs. "fix configuration" advice. False positives are harmless (the
+// detail is preserved in error_detail anyway).
+func isLikelyRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{"rate limit", "ratelimit", "429", "too many requests", "quota"} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 // Returns nil when the required service is unavailable.
 func (s *knowledgeService) resolveDocReader(ctx context.Context, engine, fileType string, isURL bool, overrides map[string]string) interfaces.DocReader {
 	switch engine {
@@ -2421,6 +2716,7 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 		return
 	}
 
+	attempt := attemptFromCtx(ctx)
 	redisKey := fmt.Sprintf("multimodal:pending:%s", knowledge.ID)
 	if s.redisClient != nil {
 		if err := s.redisClient.Set(ctx, redisKey, len(images), 24*time.Hour).Err(); err != nil {
@@ -2428,7 +2724,7 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 		}
 	}
 
-	for _, img := range images {
+	for idx, img := range images {
 		// Match image to the ParsedChunk whose content contains the image URL.
 		// ChunkID was populated by processChunks with the real DB UUID.
 		chunkID := ""
@@ -2453,6 +2749,8 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 			EnableCaption:   true,
 			Language:        lang,
 			ImageSourceType: metadata["image_source_type"],
+			Attempt:         attempt,
+			ImageIndex:      idx,
 		}
 
 		langfuse.InjectTracing(ctx, &payload)

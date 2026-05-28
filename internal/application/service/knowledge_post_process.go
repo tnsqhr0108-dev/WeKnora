@@ -17,12 +17,13 @@ import (
 // KnowledgePostProcessService acts as an orchestrator for all post-processing tasks
 // after a document has been parsed and split into chunks (including multimodal OCR/Caption).
 type KnowledgePostProcessService struct {
-	knowledgeRepo  interfaces.KnowledgeRepository
-	kbService      interfaces.KnowledgeBaseService
-	chunkService   interfaces.ChunkService
-	taskEnqueuer   interfaces.TaskEnqueuer
-	pendingRepo    interfaces.TaskPendingOpsRepository
-	redisClient    *redis.Client
+	knowledgeRepo interfaces.KnowledgeRepository
+	kbService     interfaces.KnowledgeBaseService
+	chunkService  interfaces.ChunkService
+	taskEnqueuer  interfaces.TaskEnqueuer
+	pendingRepo   interfaces.TaskPendingOpsRepository
+	redisClient   *redis.Client
+	spanTracker   SpanTracker
 }
 
 func NewKnowledgePostProcessService(
@@ -32,6 +33,7 @@ func NewKnowledgePostProcessService(
 	taskEnqueuer interfaces.TaskEnqueuer,
 	pendingRepo interfaces.TaskPendingOpsRepository,
 	redisClient *redis.Client,
+	spanTracker SpanTracker,
 ) interfaces.TaskHandler {
 	return &KnowledgePostProcessService{
 		knowledgeRepo: knowledgeRepo,
@@ -40,7 +42,15 @@ func NewKnowledgePostProcessService(
 		taskEnqueuer:  taskEnqueuer,
 		pendingRepo:   pendingRepo,
 		redisClient:   redisClient,
+		spanTracker:   spanTracker,
 	}
+}
+
+func (s *KnowledgePostProcessService) tracker() SpanTracker {
+	if s.spanTracker == nil {
+		return noopSpanTracker{}
+	}
+	return s.spanTracker
 }
 
 // Handle implements asynq handler for TypeKnowledgePostProcess.
@@ -56,6 +66,29 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	if payload.Language != "" {
 		ctx = context.WithValue(ctx, types.LanguageContextKey, payload.Language)
 	}
+
+	// Resolve attempt: payload carries it from the upstream stage, but
+	// fall back to the latest known attempt for compatibility with
+	// in-flight tasks queued before this code shipped.
+	attempt := payload.Attempt
+	if attempt <= 0 {
+		attempt = s.tracker().LatestAttempt(ctx, payload.KnowledgeID)
+	}
+
+	// Close the multimodal stage span (parent enqueued it as "running"
+	// and we never see the per-image fan-in here other than by reaching
+	// post-process). If the parent skipped multimodal entirely, the
+	// stage row will already be in "skipped" state and EndSpan is a
+	// no-op for missing rows. Per-image success/failure counts are NOT
+	// aggregated here — the frontend already walks the children when
+	// rendering the multimodal stage detail and counts them itself,
+	// avoiding an extra query path.
+	if mm := s.tracker().LookupStage(ctx, payload.KnowledgeID, attempt, types.StageMultimodal); mm != nil &&
+		mm.Kind == types.SpanKindStage {
+		s.tracker().EndSpan(ctx, mm, nil)
+	}
+
+	postSpan := s.tracker().BeginStage(ctx, payload.KnowledgeID, attempt, types.StagePostProcess, nil)
 
 	// 1. Fetch Knowledge and KB
 	knowledge, err := s.knowledgeRepo.GetKnowledgeByIDOnly(ctx, payload.KnowledgeID)
@@ -107,35 +140,58 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 	}
 
 	// 4. Spawn Summary and Question Tasks
+	enqueuedSummary := false
+	enqueuedQuestion := false
 	if len(textChunks) > 0 {
-		s.enqueueSummaryGenerationTask(ctx, payload)
+		s.enqueueSummaryGenerationTask(ctx, payload, attempt)
+		enqueuedSummary = true
 		// Question generation only makes sense for RAG indexing (improves chunk recall).
 		// Skip when only Wiki/Graph is enabled without vector/keyword search.
 		if kb.NeedsEmbeddingModel() {
-			s.enqueueQuestionGenerationIfEnabled(ctx, payload, kb)
+			enqueuedQuestion = s.enqueueQuestionGenerationIfEnabled(ctx, payload, kb, attempt)
 		}
 	}
 
 	// 5. Spawn Graph RAG Tasks — only when graph indexing is enabled in IndexingStrategy
+	enqueuedGraph := false
 	if kb.IsGraphEnabled() {
 		logger.Infof(ctx, "[KnowledgePostProcess] Spawning Graph RAG extract tasks for %d text-like chunks", len(textChunks))
-		for _, chunk := range textChunks {
-			err := NewChunkExtractTask(ctx, s.taskEnqueuer, payload.TenantID, chunk.ID, kb.SummaryModelID)
+		for i, chunk := range textChunks {
+			err := NewChunkExtractTask(ctx, s.taskEnqueuer, payload.TenantID, chunk.ID, kb.SummaryModelID,
+				payload.KnowledgeID, attempt, i)
 			if err != nil {
 				logger.Errorf(ctx, "[KnowledgePostProcess] Failed to create chunk extract task for %s: %v", chunk.ID, err)
 			}
 		}
+		enqueuedGraph = len(textChunks) > 0
 	}
 
 	// 6. Spawn Wiki Ingest Task if wiki indexing is enabled in IndexingStrategy
+	enqueuedWiki := false
 	if kb.IndexingStrategy.WikiEnabled && len(textChunks) > 0 {
 		EnqueueWikiIngest(ctx, s.taskEnqueuer, s.pendingRepo, payload.TenantID, payload.KnowledgeBaseID, payload.KnowledgeID)
 		logger.Infof(ctx, "[KnowledgePostProcess] Enqueued wiki ingest task for %s", payload.KnowledgeID)
+		enqueuedWiki = true
 	}
+	postOutput := types.JSONMap{
+		"chunks_total":      len(textChunks),
+		"enqueued_summary":  enqueuedSummary,
+		"enqueued_question": enqueuedQuestion,
+		"enqueued_wiki":     enqueuedWiki,
+		"enqueued_graph":    enqueuedGraph,
+	}
+	s.tracker().EndSpan(ctx, postSpan, postOutput)
+	// Close the root span — the parse pipeline is done. Async
+	// downstream stages (summary/question/wiki/graph) record their
+	// own spans independently; their finishing extends the trace's
+	// end-time but does not reopen the root. A late failure in one
+	// of those stages does not poison the parse result.
+	s.tracker().FinalizeAttempt(ctx, payload.KnowledgeID, attempt,
+		types.SpanStatusDone, postOutput, "", "")
 	return nil
 }
 
-func (s *KnowledgePostProcessService) enqueueSummaryGenerationTask(ctx context.Context, payload types.KnowledgePostProcessPayload) {
+func (s *KnowledgePostProcessService) enqueueSummaryGenerationTask(ctx context.Context, payload types.KnowledgePostProcessPayload, attempt int) {
 	if s.taskEnqueuer == nil {
 		return
 	}
@@ -145,6 +201,7 @@ func (s *KnowledgePostProcessService) enqueueSummaryGenerationTask(ctx context.C
 		KnowledgeBaseID: payload.KnowledgeBaseID,
 		KnowledgeID:     payload.KnowledgeID,
 		Language:        payload.Language,
+		Attempt:         attempt,
 	}
 	langfuse.InjectTracing(ctx, &taskPayload)
 	payloadBytes, err := json.Marshal(taskPayload)
@@ -161,13 +218,13 @@ func (s *KnowledgePostProcessService) enqueueSummaryGenerationTask(ctx context.C
 	}
 }
 
-func (s *KnowledgePostProcessService) enqueueQuestionGenerationIfEnabled(ctx context.Context, payload types.KnowledgePostProcessPayload, kb *types.KnowledgeBase) {
+func (s *KnowledgePostProcessService) enqueueQuestionGenerationIfEnabled(ctx context.Context, payload types.KnowledgePostProcessPayload, kb *types.KnowledgeBase, attempt int) bool {
 	if s.taskEnqueuer == nil {
-		return
+		return false
 	}
 
 	if kb.QuestionGenerationConfig == nil || !kb.QuestionGenerationConfig.Enabled {
-		return
+		return false
 	}
 
 	questionCount := kb.QuestionGenerationConfig.QuestionCount
@@ -184,18 +241,20 @@ func (s *KnowledgePostProcessService) enqueueQuestionGenerationIfEnabled(ctx con
 		KnowledgeID:     payload.KnowledgeID,
 		QuestionCount:   questionCount,
 		Language:        payload.Language,
+		Attempt:         attempt,
 	}
 	langfuse.InjectTracing(ctx, &taskPayload)
 	payloadBytes, err := json.Marshal(taskPayload)
 	if err != nil {
 		logger.Warnf(ctx, "[KnowledgePostProcess] Failed to marshal question generation payload: %v", err)
-		return
+		return false
 	}
 
 	task := asynq.NewTask(types.TypeQuestionGeneration, payloadBytes, asynq.Queue("low"), asynq.MaxRetry(3))
 	if _, err := s.taskEnqueuer.Enqueue(task); err != nil {
 		logger.Warnf(ctx, "[KnowledgePostProcess] Failed to enqueue question generation for %s: %v", payload.KnowledgeID, err)
-	} else {
-		logger.Infof(ctx, "[KnowledgePostProcess] Enqueued question generation task for %s (count=%d)", payload.KnowledgeID, questionCount)
+		return false
 	}
+	logger.Infof(ctx, "[KnowledgePostProcess] Enqueued question generation task for %s (count=%d)", payload.KnowledgeID, questionCount)
+	return true
 }
